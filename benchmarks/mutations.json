@@ -1,0 +1,162 @@
+[
+  {
+    "id": "M01",
+    "title": "clamp swaps the inner clamp direction",
+    "file": "src/numberkit/operations.py",
+    "old": "return max(low, min(value, high))",
+    "new": "return min(low, max(value, high))",
+    "test_target": "tests/test_operations.py::test_clamp_bounds_values"
+  },
+  {
+    "id": "M02",
+    "title": "clamp rejects equal bounds",
+    "file": "src/numberkit/operations.py",
+    "old": "if low > high:",
+    "new": "if low >= high:",
+    "test_target": "tests/test_operations.py::test_clamp_bounds_values"
+  },
+  {
+    "id": "M03",
+    "title": "discount uses the wrong percentage scale",
+    "file": "src/numberkit/operations.py",
+    "old": "return round(price * (1 - percent / 100), 2)",
+    "new": "return round(price * (1 - percent / 10), 2)",
+    "test_target": "tests/test_operations.py::test_discount_price_applies_percentage_and_rounding"
+  },
+  {
+    "id": "M04",
+    "title": "discount loses decimal precision",
+    "file": "src/numberkit/operations.py",
+    "old": "return round(price * (1 - percent / 100), 2)",
+    "new": "return round(price * (1 - percent / 100), 0)",
+    "test_target": "tests/test_operations.py::test_discount_price_applies_percentage_and_rounding"
+  },
+  {
+    "id": "M05",
+    "title": "moving average accepts a zero window",
+    "file": "src/numberkit/operations.py",
+    "old": "if window <= 0:",
+    "new": "if window < 0:",
+    "test_target": "tests/test_operations.py::test_moving_average_rejects_zero_window"
+  },
+  {
+    "id": "M06",
+    "title": "moving average drops an exact-sized window",
+    "file": "src/numberkit/operations.py",
+    "old": "if len(values) < window:",
+    "new": "if len(values) <= window:",
+    "test_target": "tests/test_operations.py::test_moving_average_handles_exact_and_partial_windows"
+  },
+  {
+    "id": "M07",
+    "title": "moving average computes a short slice",
+    "file": "src/numberkit/operations.py",
+    "old": "sum(values[i : i + window]) / window",
+    "new": "sum(values[i : i + window - 1]) / window",
+    "test_target": "tests/test_operations.py::test_moving_average_handles_exact_and_partial_windows"
+  },
+  {
+    "id": "M08",
+    "title": "chunked accepts zero size",
+    "file": "src/numberkit/operations.py",
+    "old": "if size <= 0:",
+    "new": "if size < 0:",
+    "test_target": "tests/test_operations.py::test_chunked_rejects_zero_size"
+  },
+  {
+    "id": "M09",
+    "title": "chunked starts at the wrong offset",
+    "file": "src/numberkit/operations.py",
+    "old": "range(0, len(items), size)",
+    "new": "range(1, len(items), size)",
+    "test_target": "tests/test_operations.py::test_chunked_preserves_order_and_tail"
+  },
+  {
+    "id": "M10",
+    "title": "fibonacci has an off-by-one loop bound",
+    "file": "src/numberkit/operations.py",
+    "old": "for _ in range(2, n + 1):",
+    "new": "for _ in range(2, n):",
+    "test_target": "tests/test_operations.py::test_fibonacci_includes_the_nth_item"
+  },
+  {
+    "id": "M11",
+    "title": "fibonacci seeds the wrong second value",
+    "file": "src/numberkit/operations.py",
+    "old": "sequence = [0, 1]",
+    "new": "sequence = [0, 0]",
+    "test_target": "tests/test_operations.py::test_fibonacci_includes_the_nth_item"
+  },
+  {
+    "id": "M12",
+    "title": "fibonacci truncates the requested item",
+    "file": "src/numberkit/operations.py",
+    "old": "return sequence[: n + 1]",
+    "new": "return sequence[:n]",
+    "test_target": "tests/test_operations.py::test_fibonacci_includes_the_nth_item"
+  },
+  {
+    "id": "M13",
+    "title": "score parsing stops normalizing ValueError",
+    "file": "src/numberkit/operations.py",
+    "old": "except (TypeError, ValueError):",
+    "new": "except TypeError:",
+    "test_target": "tests/test_operations.py::test_parse_score_normalizes_invalid_input"
+  },
+  {
+    "id": "M14",
+    "title": "score parsing excludes the upper boundary",
+    "file": "src/numberkit/operations.py",
+    "old": "if not 0 <= score <= 100:",
+    "new": "if not 0 <= score < 100:",
+    "test_target": "tests/test_operations.py::test_parse_score_accepts_numeric_strings_and_boundaries"
+  },
+  {
+    "id": "M15",
+    "title": "max difference subtracts the maximum twice",
+    "file": "src/numberkit/operations.py",
+    "old": "return max(values) - min(values)",
+    "new": "return max(values) - max(values)",
+    "test_target": "tests/test_operations.py::test_max_difference_uses_minimum_and_maximum"
+  },
+  {
+    "id": "M16",
+    "title": "max difference ignores two-item inputs",
+    "file": "src/numberkit/operations.py",
+    "old": "if len(values) < 2:",
+    "new": "if len(values) < 3:",
+    "test_target": "tests/test_operations.py::test_max_difference_uses_minimum_and_maximum"
+  },
+  {
+    "id": "M17",
+    "title": "whitespace normalization only trims edges",
+    "file": "src/numberkit/operations.py",
+    "old": "return \" \".join(text.split())",
+    "new": "return text.strip()",
+    "test_target": "tests/test_operations.py::test_normalize_whitespace_collapses_all_runs"
+  },
+  {
+    "id": "M18",
+    "title": "every other loses its stride",
+    "file": "src/numberkit/operations.py",
+    "old": "return list(items[start::2])",
+    "new": "return list(items[start::1])",
+    "test_target": "tests/test_operations.py::test_every_other_honors_start_offset"
+  },
+  {
+    "id": "M19",
+    "title": "cumulative sum starts from one",
+    "file": "src/numberkit/operations.py",
+    "old": "total = 0",
+    "new": "total = 1",
+    "test_target": "tests/test_operations.py::test_cumulative_sum_returns_each_prefix_total"
+  },
+  {
+    "id": "M20",
+    "title": "cumulative sum skips the first input",
+    "file": "src/numberkit/operations.py",
+    "old": "for value in values:",
+    "new": "for value in values[1:]:",
+    "test_target": "tests/test_operations.py::test_cumulative_sum_returns_each_prefix_total"
+  }
+]
