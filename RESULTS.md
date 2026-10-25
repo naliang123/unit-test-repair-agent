@@ -69,6 +69,3 @@ cd d:\code\unit-test-repair-agent
 - 结果与模型强相关：换模型后数字会变，不可与本文混用对比。
 - 成本估算为 `null` 是因为未配置 `INPUT_PRICE_PER_MILLION` / `OUTPUT_PRICE_PER_MILLION`。
 
-## 7. 简历可引用结论
-
-> 对步数预算做单变量消融：`max_steps=2/4/12` 下成功率分别为 `0% / 95% / 100%`，平均步数 3.85–3.95。失败统一以 `step_budget_exhausted` 结束并触发回滚；典型失败案例 M17 显示模型在预算边界因多读一次文件而耗尽步数、未能验证修改，验证了有界循环与失败回滚的有效性。
