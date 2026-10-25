@@ -28,6 +28,7 @@ class Settings:
     max_tool_output_chars: int = 6000
     verify_all: bool = True
     approve_edits: bool = False
+    mcp_servers_json: str = ""
     input_price_per_million: float = 0.0
     output_price_per_million: float = 0.0
 
@@ -46,6 +47,7 @@ class Settings:
             ),
             verify_all=_as_bool(os.getenv("VERIFY_ALL_TESTS"), True),
             approve_edits=_as_bool(os.getenv("APPROVE_EDITS"), False),
+            mcp_servers_json=os.getenv("MCP_SERVERS", ""),
             input_price_per_million=float(os.getenv("INPUT_PRICE_PER_MILLION", "0")),
             output_price_per_million=float(os.getenv("OUTPUT_PRICE_PER_MILLION", "0")),
         )

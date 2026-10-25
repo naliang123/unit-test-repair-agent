@@ -30,9 +30,14 @@ def build_repair_graph(
     settings: Settings,
     trace: JsonlTrace,
     checkpointer: Any,
+    mcp_registry: Any = None,
 ):
+    all_tool_schemas = TOOL_SCHEMAS + (
+        mcp_registry.tool_schemas() if mcp_registry is not None else []
+    )
+
     def decide(state: RepairState) -> RepairState:
-        response = model.complete(state.get("messages", []), TOOL_SCHEMAS)
+        response = model.complete(state.get("messages", []), all_tool_schemas)
         steps = int(state.get("steps", 0)) + 1
         tokens = {
             key: int(state.get("tokens", {}).get(key, 0)) + response.usage.get(key, 0)
@@ -104,6 +109,11 @@ def build_repair_graph(
     def route_after_approve(state: RepairState) -> str:
         return "finish" if state.get("reason") else "act"
 
+    def _dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if mcp_registry is not None and name in mcp_registry.tool_names():
+            return mcp_registry.call(name, arguments)
+        return tools.execute(name, arguments)
+
     def act(state: RepairState) -> RepairState:
         messages = list(state.get("messages", []))
         target_passed = False
@@ -111,7 +121,7 @@ def build_repair_graph(
             if call.get("parse_error"):
                 result = {"ok": False, "error": call["parse_error"]}
             else:
-                result = tools.execute(call.get("name", ""), call.get("arguments", {}))
+                result = _dispatch(call.get("name", ""), call.get("arguments", {}))
             trace.event(
                 "tool_result",
                 step=state.get("steps", 0),

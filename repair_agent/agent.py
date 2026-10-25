@@ -14,6 +14,7 @@ from langgraph.types import Command
 
 from .config import Settings
 from .graph import build_repair_graph
+from .mcp import MCPToolRegistry, parse_mcp_servers
 from .models import ChatModel
 from .prompts import SYSTEM_PROMPT, initial_user_prompt
 from .tools import ToolBox
@@ -128,65 +129,81 @@ class RepairAgent:
     ) -> dict[str, Any]:
         tools = self._tools(workspace.path)
         checkpoint_path = self.run_dir / "checkpoints.sqlite"
+        mcp_registry = self._mcp_registry()
         try:
-            with SqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
-                graph = build_repair_graph(
-                    model=self.model,
-                    tools=tools,
-                    settings=self.settings,
-                    trace=self.trace,
-                    checkpointer=checkpointer,
+            if mcp_registry is not None:
+                try:
+                    mcp_registry.connect()
+                    self.trace.event(
+                        "mcp_connected", tools=sorted(mcp_registry.tool_names())
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.trace.event(
+                        "mcp_connect_error", error=f"{type(exc).__name__}: {exc}"
+                    )
+            try:
+                with SqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
+                    graph = build_repair_graph(
+                        model=self.model,
+                        tools=tools,
+                        settings=self.settings,
+                        trace=self.trace,
+                        checkpointer=checkpointer,
+                        mcp_registry=mcp_registry,
+                    )
+                    config = {
+                        "configurable": {"thread_id": "repair"},
+                        "recursion_limit": max(50, self.settings.max_steps * 6 + 20),
+                    }
+                    if resume_command is not None:
+                        invocation: Any = resume_command
+                    elif graph_input is not None:
+                        invocation = graph_input
+                    else:
+                        invocation = None
+                    result = graph.invoke(invocation, config=config)
+                if "__interrupt__" in result:
+                    pending = result["__interrupt__"][0].value
+                    self.trace.event(
+                        "run_paused", reason="approval_required", pending=pending
+                    )
+                    return self._finish(
+                        workspace,
+                        baseline,
+                        started,
+                        status="paused",
+                        reason="approval_required",
+                        steps=int(result.get("steps", 0)),
+                        tokens=result.get("tokens", self._empty_tokens()),
+                        paused=True,
+                        pending_approval=pending,
+                    )
+                return self._finish(
+                    workspace,
+                    baseline,
+                    started,
+                    status=result.get("status", "failed"),
+                    reason=result.get("reason", "graph_ended_without_reason"),
+                    steps=int(result.get("steps", 0)),
+                    tokens=result.get("tokens", self._empty_tokens()),
                 )
-                config = {
-                    "configurable": {"thread_id": "repair"},
-                    "recursion_limit": max(50, self.settings.max_steps * 4 + 10),
-                }
-                if resume_command is not None:
-                    invocation: Any = resume_command
-                elif graph_input is not None:
-                    invocation = graph_input
-                else:
-                    invocation = None
-                result = graph.invoke(invocation, config=config)
-            if "__interrupt__" in result:
-                pending = result["__interrupt__"][0].value
-                self.trace.event(
-                    "run_paused", reason="approval_required", pending=pending
-                )
+            except KeyboardInterrupt:
+                self.trace.event("run_paused", reason="interrupted_by_user")
                 return self._finish(
                     workspace,
                     baseline,
                     started,
                     status="paused",
-                    reason="approval_required",
-                    steps=int(result.get("steps", 0)),
-                    tokens=result.get("tokens", self._empty_tokens()),
+                    reason="interrupted_by_user",
+                    steps=0,
+                    tokens=self._empty_tokens(),
                     paused=True,
-                    pending_approval=pending,
                 )
-            return self._finish(
-                workspace,
-                baseline,
-                started,
-                status=result.get("status", "failed"),
-                reason=result.get("reason", "graph_ended_without_reason"),
-                steps=int(result.get("steps", 0)),
-                tokens=result.get("tokens", self._empty_tokens()),
-            )
-        except KeyboardInterrupt:
-            self.trace.event("run_paused", reason="interrupted_by_user")
-            return self._finish(
-                workspace,
-                baseline,
-                started,
-                status="paused",
-                reason="interrupted_by_user",
-                steps=0,
-                tokens=self._empty_tokens(),
-                paused=True,
-            )
-        except Exception as exc:
-            return self._fail(workspace, baseline, started, exc)
+            except Exception as exc:
+                return self._fail(workspace, baseline, started, exc)
+        finally:
+            if mcp_registry is not None:
+                mcp_registry.close()
 
     def _finish(
         self,
@@ -290,6 +307,10 @@ class RepairAgent:
             max_output_chars=self.settings.max_tool_output_chars,
         )
 
+    def _mcp_registry(self) -> MCPToolRegistry | None:
+        specs = parse_mcp_servers(self.settings.mcp_servers_json)
+        return MCPToolRegistry(specs) if specs else None
+
     def _write_context(
         self, workspace: GitWorktree, started: float, active: bool
     ) -> None:
@@ -312,6 +333,7 @@ class RepairAgent:
                     "max_tool_output_chars": self.settings.max_tool_output_chars,
                     "verify_all": self.settings.verify_all,
                     "approve_edits": self.settings.approve_edits,
+                    "mcp_servers_json": self.settings.mcp_servers_json,
                     "input_price_per_million": self.settings.input_price_per_million,
                     "output_price_per_million": self.settings.output_price_per_million,
                 },

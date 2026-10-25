@@ -2,7 +2,7 @@
 
 一个围绕 **pytest 失败反馈**构建的迷你 Coding Agent：读取代码、定位原因、精确修改、运行测试，并根据新的报错继续迭代。每次运行在独立 Git worktree 中进行；失败会回滚，成功会导出补丁，全过程记录 JSONL trace。
 
-这不是调用一次 LLM 生成答案的示例。项目使用 **LangChain** 统一模型接入和工具调用，使用 **LangGraph** 将决策、人工确认、工具执行、全量验证与结束状态编排成显式状态图；四种工具、路径防护、测试执行、worktree 隔离、回滚、轨迹、基准任务和评测报告仍由本项目实现。
+这不是调用一次 LLM 生成答案的示例。项目使用 **LangChain** 统一模型接入和工具调用，使用 **LangGraph** 将决策、人工确认、工具执行、全量验证与结束状态编排成显式状态图；四种内置工具、**MCP 外部工具**、路径防护、测试执行、worktree 隔离、回滚、轨迹、基准任务和评测报告仍由本项目实现。
 
 ## 1. 你会得到什么
 
@@ -16,6 +16,7 @@
 - 失败回滚、worktree 清理、成功/失败补丁分离。
 - JSONL 逐步轨迹：模型决策、工具参数、测试观察、token 使用量和最终状态。
 - 20 个已验证的代码缺陷任务，以及成功率、平均步数、token 和可选成本统计。
+- MCP 工具接入：可配置 stdio / sse 服务器，把外部工具以 `mcp__*` 形式交给模型调用。
 - 不需要 API Key 的离线测试和脚本化假模型测试。
 
 **当前没有填写任何“修复成功率”。** 只有实际执行 `evaluate` 后生成的 `evaluation.md` 才能作为实验结果；不同模型的结果不能混用。
@@ -28,6 +29,7 @@ unit-test-repair-agent/
 │   ├── agent.py          # 运行生命周期、基线、patch、暂停/恢复与结果汇总
 │   ├── graph.py          # LangGraph 节点与条件边：决策/批准/执行/验证/结束
 │   ├── models.py         # 模型协议、LangChain 工具调用适配器
+│   ├── mcp.py            # MCP 工具接入：stdio/sse 服务器与 mcp__* 工具调度
 │   ├── tools.py          # 四种工具、schema、路径防护、pytest 执行
 │   ├── workspace.py      # Git worktree、diff、reset/clean 回滚与清理
 │   ├── benchmark.py      # 缺陷任务加载、临时仓库生成、基准有效性检查
@@ -43,7 +45,10 @@ unit-test-repair-agent/
 ├── tests/
 │   ├── test_agent.py     # 假模型：成功修复、失败回滚、人工批准/拒绝，不调 API
 │   ├── test_tools.py     # 精确替换、路径防护、搜索和测试工具
-│   └── test_benchmark.py # 任务完整性与抽样基准验证
+│   ├── test_benchmark.py # 任务完整性与抽样基准验证
+│   └── test_mcp.py       # MCP 服务器配置解析
+├── examples/
+│   └── demo_mcp_server.py # 一个最小 stdio MCP 服务器，用于演示 MCP 接入
 ├── .env.example          # 配置模板，不包含真实密钥
 ├── pyproject.toml        # 包信息、依赖与 pytest 配置
 └── runs/                 # 运行后生成；已被 Git 忽略
@@ -150,6 +155,7 @@ MODEL_ID=deepseek-chat
 | `MAX_TOOL_OUTPUT_CHARS` | 6000 | 回喂模型的最大测试/文件输出长度 |
 | `VERIFY_ALL_TESTS` | true | 目标通过后是否运行完整测试集 |
 | `APPROVE_EDITS` | false | 修改生产文件前是否暂停并等待人工确认 |
+| `MCP_SERVERS` | 空 | 可选：MCP 服务器 JSON 数组（stdio/sse） |
 | `INPUT_PRICE_PER_MILLION` | 0 | 可选：每百万输入 token 的美元价格 |
 | `OUTPUT_PRICE_PER_MILLION` | 0 | 可选：每百万输出 token 的美元价格 |
 
@@ -297,7 +303,7 @@ Git worktree 隔离 + 基线失败观察
    ├─ 否 / 已批准 ─────→ [act] 执行工具并记录观察
    └─ 模型不再调用工具 → [finish]
    ↓
-[act] read/search → edit → run_tests
+[act] read/search → edit → run_tests / mcp__*（MCP 外部工具）
    ↓
 目标通过？
    ├─ 否且步数未耗尽 → 回到 [decide]
@@ -322,6 +328,10 @@ Agent 的准备与收尾涉及文件系统、Git 进程和不可序列化的运�
 ### `models.py`：为什么用 LangChain
 
 LangChain 负责统一模型调用、消息结构和工具绑定，并把模型返回转换为项目内的 `ToolCall`。项目不直接依赖某个 SDK 的私有字段，替换 OpenAI 兼容提供商时仍由 `.env` 控制。
+
+### `mcp.py`：为什么把 MCP 工具做成 `mcp__*` 前缀
+
+MCP 服务器返回的工具名可能与内置工具重名。注册时统一加 `mcp__<server>__<tool>` 前缀，避免冲突，也让 trace 一眼能看出调用来自外部工具。会话跑在独立后台事件循环上，避免每次调用都重建连接；MCP 只是**附加能力**，连接失败会被记录到 trace 并继续用内置工具，不影响主修复闭环。
 
 ### `tools.py`：为什么使用精确字符串替换
 
@@ -370,12 +380,22 @@ LangChain 负责统一模型调用、消息结构和工具绑定，并把模型�
 **恢复时模型或密钥已变化**
 `resume` 会从 `run_context.json` 恢复模型名、步数和验证设置；密钥仍从 `.env` 读取。更换模型后继续旧 checkpoint，结果不能和原运行混合统计。
 
-## 13. 当前边界
+## 13. MCP 工具接入
+
+在 `.env` 里配置 `MCP_SERVERS`（JSON 数组），例如接入内置演示服务器：
+
+```dotenv
+MCP_SERVERS=[{"name":"memory","command":".venv\\Scripts\\python.exe","args":["-m","examples.demo_mcp_server"]}]
+```
+
+连接后，模型的工具列表会多出 `mcp__memory__remember`、`mcp__memory__recall`。`command` 必须指向一个安装了 `mcp` 的 Python（Windows 下建议用本项目 `.venv\Scripts\python.exe` 的绝对路径）。
+
+## 14. 当前边界
 
 - 只支持修改已有文本文件，没有“新建文件”工具。
 - 不是通用 shell Agent，也不是安全的多租户沙箱；请在可丢弃的测试仓库中使用。
 - 只处理本地 pytest，不包含浏览器、网络检索或跨仓库依赖修复。
 - 内置 20 题用于验证闭环和比较模型/策略，不应宣称代表真实大型项目修复能力。
-- 已接入 LangChain 模型层和 LangGraph 编排、人工确认、SQLite checkpoint；尚未包含 MCP、Web UI、多智能体或并发评测。
+- 已接入 LangChain/LangGraph 编排、人工确认、SQLite checkpoint 与 MCP 工具；尚未包含 MCP 客户端鉴权、并发评测、多租户隔离或生产级任务队列。
 - 真实模型效果取决于模型能力、提示词、步数预算和任务难度，必须实测。
 
