@@ -1,4 +1,4 @@
-"""Bounded observe-decide-act loop for repository repair."""
+"""Repository repair lifecycle orchestrated by a persistent LangGraph graph."""
 
 from __future__ import annotations
 
@@ -9,10 +9,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command
+
 from .config import Settings
+from .graph import build_repair_graph
 from .models import ChatModel
 from .prompts import SYSTEM_PROMPT, initial_user_prompt
-from .tools import TOOL_SCHEMAS, ToolBox
+from .tools import ToolBox
 from .trace import JsonlTrace, write_json
 from .workspace import GitWorktree
 
@@ -35,127 +39,179 @@ class RepairAgent:
         self.trace = JsonlTrace(self.run_dir / "trace.jsonl")
 
     def run(self) -> dict[str, Any]:
-        started = time.monotonic()
+        started = time.time()
         workspace = GitWorktree(self.repo, self.run_dir)
-        status, reason = "failed", "not_started"
-        steps = 0
-        rollback_performed = False
         baseline: dict[str, Any] = {}
-        attempt_patch = ""
-        final_patch = ""
-        tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-
         try:
             worktree = workspace.create()
-            tools = ToolBox(
-                worktree,
-                test_timeout=self.settings.test_timeout,
-                max_output_chars=self.settings.max_tool_output_chars,
-            )
+            tools = self._tools(worktree)
             self.trace.event(
                 "run_started",
                 repo=str(workspace.source_repo),
                 base_commit=workspace.base_commit,
                 test_target=self.test_target,
                 max_steps=self.settings.max_steps,
+                approve_edits=self.settings.approve_edits,
             )
             baseline = tools.run_tests(self.test_target)
             self.trace.event("baseline_test", result=baseline)
             if not baseline.get("ok"):
-                raise RuntimeError(f"Could not execute baseline tests: {baseline.get('error')}")
+                raise RuntimeError(
+                    f"Could not execute baseline tests: {baseline.get('error')}"
+                )
+            self._write_context(workspace, started, active=True)
             if baseline.get("passed"):
-                status, reason = "invalid", "baseline_already_passing"
-            else:
-                messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": initial_user_prompt(
-                            self.test_target, baseline.get("output", "")
-                        ),
-                    },
-                ]
-                for step in range(1, self.settings.max_steps + 1):
-                    response = self.model.complete(messages, TOOL_SCHEMAS)
-                    steps = step
-                    for key in tokens:
-                        tokens[key] += response.usage.get(key, 0)
-                    self.trace.event(
-                        "model_response",
-                        step=step,
-                        content=response.content,
-                        tool_calls=[
-                            {"name": call.name, "arguments": call.arguments}
-                            for call in response.tool_calls
-                        ],
-                        usage=response.usage,
-                    )
-                    messages.append(response.assistant_message)
-                    if not response.tool_calls:
-                        reason = "model_stopped_without_passing_tests"
-                        break
+                return self._finish(
+                    workspace,
+                    baseline,
+                    started,
+                    status="invalid",
+                    reason="baseline_already_passing",
+                    steps=0,
+                    tokens=self._empty_tokens(),
+                )
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": initial_user_prompt(
+                        self.test_target, baseline.get("output", "")
+                    ),
+                },
+            ]
+            return self._execute_graph(
+                workspace=workspace,
+                baseline=baseline,
+                started=started,
+                graph_input={"messages": messages},
+            )
+        except Exception as exc:
+            return self._fail(workspace, baseline, started, exc)
 
-                    target_passed = False
-                    for call in response.tool_calls:
-                        if call.parse_error:
-                            result = {"ok": False, "error": call.parse_error}
-                        else:
-                            result = tools.execute(call.name, call.arguments)
-                        self.trace.event(
-                            "tool_result", step=step, tool=call.name, result=result
-                        )
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": call.id,
-                                "content": json.dumps(result, ensure_ascii=False),
-                            }
-                        )
-                        if call.name == "edit_file" and result.get("ok"):
-                            target_passed = False
-                        if call.name == "run_tests" and result.get("ok"):
-                            target_passed = bool(result.get("passed"))
+    def resume(self, decision: bool | None = None) -> dict[str, Any]:
+        context = self._read_context()
+        summary_path = self.run_dir / "summary.json"
+        if not context.get("active") and summary_path.exists():
+            return json.loads(summary_path.read_text(encoding="utf-8"))
+        workspace = GitWorktree(Path(context["repo"]), self.run_dir)
+        workspace.base_commit = context["base_commit"]
+        if not workspace.path.exists():
+            raise RuntimeError("The saved worktree is missing; this run cannot be resumed.")
+        workspace.created = True
+        baseline_path = self.run_dir / "baseline.json"
+        baseline = (
+            json.loads(baseline_path.read_text(encoding="utf-8"))
+            if baseline_path.exists()
+            else {}
+        )
+        self.trace.event(
+            "run_resumed",
+            decision=decision,
+            checkpoint="checkpoints.sqlite",
+        )
+        command = Command(resume=decision) if decision is not None else None
+        return self._execute_graph(
+            workspace=workspace,
+            baseline=baseline,
+            started=float(context.get("started_unix", time.time())),
+            graph_input=None,
+            resume_command=command,
+        )
 
-                    if target_passed:
-                        if not self.settings.verify_all:
-                            status, reason = "success", "target_tests_passed"
-                            break
-                        verification = tools.run_tests(".")
-                        self.trace.event(
-                            "full_suite_verification", step=step, result=verification
-                        )
-                        if verification.get("passed"):
-                            status, reason = "success", "all_tests_passed"
-                            break
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": "The target passed but the full test suite failed. "
-                                "Inspect and repair the regression, then test again:\n"
-                                + verification.get("output", ""),
-                            }
-                        )
+    def _execute_graph(
+        self,
+        workspace: GitWorktree,
+        baseline: dict[str, Any],
+        started: float,
+        graph_input: dict[str, Any] | None,
+        resume_command: Command | None = None,
+    ) -> dict[str, Any]:
+        tools = self._tools(workspace.path)
+        checkpoint_path = self.run_dir / "checkpoints.sqlite"
+        try:
+            with SqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
+                graph = build_repair_graph(
+                    model=self.model,
+                    tools=tools,
+                    settings=self.settings,
+                    trace=self.trace,
+                    checkpointer=checkpointer,
+                )
+                config = {
+                    "configurable": {"thread_id": "repair"},
+                    "recursion_limit": max(50, self.settings.max_steps * 4 + 10),
+                }
+                if resume_command is not None:
+                    invocation: Any = resume_command
+                elif graph_input is not None:
+                    invocation = graph_input
                 else:
-                    reason = "step_budget_exhausted"
+                    invocation = None
+                result = graph.invoke(invocation, config=config)
+            if "__interrupt__" in result:
+                pending = result["__interrupt__"][0].value
+                self.trace.event(
+                    "run_paused", reason="approval_required", pending=pending
+                )
+                return self._finish(
+                    workspace,
+                    baseline,
+                    started,
+                    status="paused",
+                    reason="approval_required",
+                    steps=int(result.get("steps", 0)),
+                    tokens=result.get("tokens", self._empty_tokens()),
+                    paused=True,
+                    pending_approval=pending,
+                )
+            return self._finish(
+                workspace,
+                baseline,
+                started,
+                status=result.get("status", "failed"),
+                reason=result.get("reason", "graph_ended_without_reason"),
+                steps=int(result.get("steps", 0)),
+                tokens=result.get("tokens", self._empty_tokens()),
+            )
+        except KeyboardInterrupt:
+            self.trace.event("run_paused", reason="interrupted_by_user")
+            return self._finish(
+                workspace,
+                baseline,
+                started,
+                status="paused",
+                reason="interrupted_by_user",
+                steps=0,
+                tokens=self._empty_tokens(),
+                paused=True,
+            )
+        except Exception as exc:
+            return self._fail(workspace, baseline, started, exc)
 
-            attempt_patch = workspace.diff()
+    def _finish(
+        self,
+        workspace: GitWorktree,
+        baseline: dict[str, Any],
+        started: float,
+        status: str,
+        reason: str,
+        steps: int,
+        tokens: dict[str, int],
+        paused: bool = False,
+        pending_approval: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        attempt_patch = workspace.diff() if workspace.created else ""
+        final_patch = ""
+        rollback_performed = False
+        cleanup_warning = None
+        if not paused:
             if status == "success":
                 final_patch = attempt_patch
             else:
                 workspace.rollback()
                 rollback_performed = True
-        except Exception as exc:
-            status, reason = "failed", f"{type(exc).__name__}: {exc}"
-            self.trace.event("run_error", error=reason)
-            try:
-                attempt_patch = workspace.diff()
-                if workspace.created:
-                    workspace.rollback()
-                    rollback_performed = True
-            except Exception as rollback_error:
-                self.trace.event("rollback_error", error=str(rollback_error))
-        finally:
             cleanup_warning = workspace.cleanup()
+        self._write_context(workspace, started, active=paused)
 
         (self.run_dir / "attempt.patch").write_text(attempt_patch, encoding="utf-8")
         (self.run_dir / "final.patch").write_text(final_patch, encoding="utf-8")
@@ -173,13 +229,16 @@ class RepairAgent:
             "run_id": self.run_dir.name,
             "status": status,
             "success": status == "success",
+            "paused": paused,
+            "resumable": paused,
             "reason": reason,
+            "pending_approval": pending_approval,
             "test_target": self.test_target,
             "steps": steps,
             "max_steps": self.settings.max_steps,
             "tokens": tokens,
             "estimated_cost_usd": estimated_cost,
-            "wall_time_seconds": round(time.monotonic() - started, 3),
+            "wall_time_seconds": round(time.time() - started, 3),
             "rollback_performed": rollback_performed,
             "worktree_cleanup_warning": cleanup_warning,
             "changed_patch_bytes": len(final_patch.encode("utf-8")),
@@ -188,14 +247,83 @@ class RepairAgent:
                 "baseline": "baseline.json",
                 "attempt_patch": "attempt.patch",
                 "final_patch": "final.patch",
+                "checkpoint": "checkpoints.sqlite",
+                "context": "run_context.json",
             },
         }
         write_json(self.run_dir / "summary.json", summary)
-        self.trace.event(
-            "run_finished",
-            status=status,
-            reason=reason,
-            steps=steps,
-            rollback_performed=rollback_performed,
-        )
+        if paused:
+            self.trace.event("pause_finished", status=status, reason=reason, steps=steps)
+        else:
+            self.trace.event(
+                "run_finished",
+                status=status,
+                reason=reason,
+                steps=steps,
+                rollback_performed=rollback_performed,
+            )
         return summary
+
+    def _fail(
+        self,
+        workspace: GitWorktree,
+        baseline: dict[str, Any],
+        started: float,
+        exc: Exception,
+    ) -> dict[str, Any]:
+        reason = f"{type(exc).__name__}: {exc}"
+        self.trace.event("run_error", error=reason)
+        return self._finish(
+            workspace,
+            baseline,
+            started,
+            status="failed",
+            reason=reason,
+            steps=0,
+            tokens=self._empty_tokens(),
+        )
+
+    def _tools(self, worktree: Path) -> ToolBox:
+        return ToolBox(
+            worktree,
+            test_timeout=self.settings.test_timeout,
+            max_output_chars=self.settings.max_tool_output_chars,
+        )
+
+    def _write_context(
+        self, workspace: GitWorktree, started: float, active: bool
+    ) -> None:
+        if not workspace.base_commit:
+            return
+        write_json(
+            self.run_dir / "run_context.json",
+            {
+                "version": 1,
+                "repo": str(workspace.source_repo),
+                "test_target": self.test_target,
+                "base_commit": workspace.base_commit,
+                "started_unix": started,
+                "active": active,
+                "settings": {
+                    "model": self.settings.model,
+                    "base_url": self.settings.base_url,
+                    "max_steps": self.settings.max_steps,
+                    "test_timeout": self.settings.test_timeout,
+                    "max_tool_output_chars": self.settings.max_tool_output_chars,
+                    "verify_all": self.settings.verify_all,
+                    "approve_edits": self.settings.approve_edits,
+                    "input_price_per_million": self.settings.input_price_per_million,
+                    "output_price_per_million": self.settings.output_price_per_million,
+                },
+            },
+        )
+
+    def _read_context(self) -> dict[str, Any]:
+        path = self.run_dir / "run_context.json"
+        if not path.exists():
+            raise RuntimeError(f"Missing resumable context: {path}")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _empty_tokens() -> dict[str, int]:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}

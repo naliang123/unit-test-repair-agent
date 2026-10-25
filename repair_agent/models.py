@@ -1,8 +1,8 @@
-"""Model protocol and OpenAI-compatible tool-calling adapter."""
+"""Model protocol and LangChain-powered tool-calling adapter."""
 
 from __future__ import annotations
 
-import json
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -19,7 +19,7 @@ class ToolCall:
 
 @dataclass(slots=True)
 class ModelResponse:
-    assistant_message: dict[str, Any]
+    assistant_message: Any
     content: str
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
@@ -27,58 +27,74 @@ class ModelResponse:
 
 class ChatModel(Protocol):
     def complete(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        self, messages: list[Any], tools: list[dict[str, Any]]
     ) -> ModelResponse: ...
 
 
-class OpenAICompatibleModel:
+class LangChainModel:
     def __init__(self, settings: Settings) -> None:
-        from openai import OpenAI
+        from langchain_openai import ChatOpenAI
 
-        self._client = OpenAI(api_key=settings.api_key, base_url=settings.base_url)
-        self._model = settings.model
-
-    def complete(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
-    ) -> ModelResponse:
-        response = self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
+        self._model = ChatOpenAI(
+            model=settings.model,
+            api_key=settings.api_key,
+            base_url=settings.base_url,
             temperature=0,
         )
-        message = response.choices[0].message
-        assistant_message: dict[str, Any] = {
-            "role": "assistant",
-            "content": message.content,
-        }
+
+    def complete(
+        self, messages: list[Any], tools: list[dict[str, Any]]
+    ) -> ModelResponse:
+        response = self._model.bind_tools(tools).invoke(messages)
         calls: list[ToolCall] = []
-        if message.tool_calls:
-            assistant_message["tool_calls"] = [
-                call.model_dump(exclude_none=True) for call in message.tool_calls
-            ]
-            for call in message.tool_calls:
-                raw = call.function.arguments or "{}"
-                parse_error = None
-                try:
-                    arguments = json.loads(raw)
-                    if not isinstance(arguments, dict):
-                        raise ValueError("tool arguments must be a JSON object")
-                except (json.JSONDecodeError, ValueError) as exc:
-                    arguments = {}
-                    parse_error = str(exc)
-                calls.append(
-                    ToolCall(call.id, call.function.name, arguments, parse_error)
+        for index, call in enumerate(response.tool_calls or []):
+            arguments = call.get("args", {})
+            parse_error = None
+            if not isinstance(arguments, dict):
+                arguments = {}
+                parse_error = "tool arguments must be a JSON object"
+            calls.append(
+                ToolCall(
+                    id=call.get("id") or f"tool-{index}-{uuid.uuid4().hex[:8]}",
+                    name=call.get("name", ""),
+                    arguments=arguments,
+                    parse_error=parse_error,
                 )
-        usage = {
-            "prompt_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
-            "completion_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
-            "total_tokens": getattr(response.usage, "total_tokens", 0) or 0,
-        }
+            )
+        for index, call in enumerate(getattr(response, "invalid_tool_calls", []) or []):
+            calls.append(
+                ToolCall(
+                    id=call.get("id") or f"invalid-{index}-{uuid.uuid4().hex[:8]}",
+                    name=call.get("name") or "unknown",
+                    arguments={},
+                    parse_error=call.get("error") or "invalid tool call",
+                )
+            )
+        usage = self._usage(response)
+        content = response.content if isinstance(response.content, str) else str(response.content)
         return ModelResponse(
-            assistant_message=assistant_message,
-            content=message.content or "",
+            assistant_message=response,
+            content=content,
             tool_calls=calls,
             usage=usage,
         )
+
+    @staticmethod
+    def _usage(response: Any) -> dict[str, int]:
+        metadata = getattr(response, "usage_metadata", None) or {}
+        usage = {
+            "prompt_tokens": int(metadata.get("input_tokens", 0) or 0),
+            "completion_tokens": int(metadata.get("output_tokens", 0) or 0),
+            "total_tokens": int(metadata.get("total_tokens", 0) or 0),
+        }
+        if usage["total_tokens"]:
+            return usage
+        raw = (getattr(response, "response_metadata", None) or {}).get("token_usage") or {}
+        return {
+            "prompt_tokens": int(raw.get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(raw.get("completion_tokens", 0) or 0),
+            "total_tokens": int(raw.get("total_tokens", 0) or 0),
+        }
+
+
+OpenAICompatibleModel = LangChainModel

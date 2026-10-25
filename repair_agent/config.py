@@ -27,6 +27,7 @@ class Settings:
     test_timeout: int = 45
     max_tool_output_chars: int = 6000
     verify_all: bool = True
+    approve_edits: bool = False
     input_price_per_million: float = 0.0
     output_price_per_million: float = 0.0
 
@@ -44,6 +45,7 @@ class Settings:
                 os.getenv("MAX_TOOL_OUTPUT_CHARS", str(defaults.max_tool_output_chars))
             ),
             verify_all=_as_bool(os.getenv("VERIFY_ALL_TESTS"), True),
+            approve_edits=_as_bool(os.getenv("APPROVE_EDITS"), False),
             input_price_per_million=float(os.getenv("INPUT_PRICE_PER_MILLION", "0")),
             output_price_per_million=float(os.getenv("OUTPUT_PRICE_PER_MILLION", "0")),
         )

@@ -20,7 +20,11 @@ class JsonlTrace:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self._sequence = 0
+        self._sequence = (
+            sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+            if path.exists()
+            else 0
+        )
 
     def event(self, event_type: str, **payload: Any) -> None:
         self._sequence += 1

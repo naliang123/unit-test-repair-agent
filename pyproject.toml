@@ -9,7 +9,10 @@ description = "A traceable coding agent that repairs failing pytest suites in is
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "openai>=1.40.0,<3",
+    "langchain>=1.4.0,<2",
+    "langchain-openai>=1.7.0,<2",
+    "langgraph>=1.2.0,<2",
+    "langgraph-checkpoint-sqlite>=3.0,<4",
     "python-dotenv>=1.0.0,<2",
 ]
 

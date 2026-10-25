@@ -2,14 +2,16 @@
 
 一个围绕 **pytest 失败反馈**构建的迷你 Coding Agent：读取代码、定位原因、精确修改、运行测试，并根据新的报错继续迭代。每次运行在独立 Git worktree 中进行；失败会回滚，成功会导出补丁，全过程记录 JSONL trace。
 
-这不是调用一次 LLM 生成答案的示例，也不依赖 Agent 框架。Agent loop、四种工具、路径防护、测试执行、worktree 隔离、回滚、轨迹、基准任务和评测报告都在本仓库中。
+这不是调用一次 LLM 生成答案的示例。项目使用 **LangChain** 统一模型接入和工具调用，使用 **LangGraph** 将决策、人工确认、工具执行、全量验证与结束状态编排成显式状态图；四种工具、路径防护、测试执行、worktree 隔离、回滚、轨迹、基准任务和评测报告仍由本项目实现。
 
 ## 1. 你会得到什么
 
-- 一个有界的 ReAct 风格循环：模型响应 → 工具调用 → 观察结果 → 再次决策。
+- 一个由 LangGraph 管理的有界 Agent 状态图：模型决策 → 可选人工确认 → 工具调用 → 观察结果 → 全量验证 → 结束。
 - 四种真实工具：`read_file`、`edit_file`、`search_code`、`run_tests`。
-- OpenAI 兼容的 Function Calling 接口，默认示例为 DeepSeek，可替换提供商和模型。
+- LangChain 的 OpenAI 兼容 Function Calling 接口，默认示例为 DeepSeek，可替换提供商和模型。
 - Git worktree 隔离：原仓库不会被 Agent 直接修改。
+- SQLite checkpoint：中断或等待人工批准后，可从保存状态恢复。
+- 可选 Human-in-the-loop：每次修改生产文件前暂停，由你批准或拒绝。
 - 目标测试通过后自动运行完整测试集，检查是否引入回归。
 - 失败回滚、worktree 清理、成功/失败补丁分离。
 - JSONL 逐步轨迹：模型决策、工具参数、测试观察、token 使用量和最终状态。
@@ -23,8 +25,9 @@
 ```text
 unit-test-repair-agent/
 ├── repair_agent/
-│   ├── agent.py          # 有界 Agent 主循环、全量回归检查、运行汇总
-│   ├── models.py         # 模型协议、OpenAI 兼容工具调用适配器
+│   ├── agent.py          # 运行生命周期、基线、patch、暂停/恢复与结果汇总
+│   ├── graph.py          # LangGraph 节点与条件边：决策/批准/执行/验证/结束
+│   ├── models.py         # 模型协议、LangChain 工具调用适配器
 │   ├── tools.py          # 四种工具、schema、路径防护、pytest 执行
 │   ├── workspace.py      # Git worktree、diff、reset/clean 回滚与清理
 │   ├── benchmark.py      # 缺陷任务加载、临时仓库生成、基准有效性检查
@@ -32,13 +35,13 @@ unit-test-repair-agent/
 │   ├── prompts.py        # 系统提示词和初始失败反馈
 │   ├── config.py         # .env 配置和参数校验
 │   ├── trace.py          # JSONL trace 与 JSON 落盘
-│   ├── cli.py            # run / evaluate / validate-benchmark 命令
+│   ├── cli.py            # run / resume / evaluate / validate-benchmark 命令
 │   └── __main__.py       # python -m repair_agent 入口
 ├── benchmarks/
 │   ├── base_project/     # 原始 numberkit 小包及 17 个 pytest 测试
 │   └── mutations.json    # 20 个精确代码变异及对应失败测试
 ├── tests/
-│   ├── test_agent.py     # 脚本化假模型：成功修复、失败回滚，不调 API
+│   ├── test_agent.py     # 假模型：成功修复、失败回滚、人工批准/拒绝，不调 API
 │   ├── test_tools.py     # 精确替换、路径防护、搜索和测试工具
 │   └── test_benchmark.py # 任务完整性与抽样基准验证
 ├── .env.example          # 配置模板，不包含真实密钥
@@ -93,7 +96,7 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 .venv\Scripts\python.exe -m pytest
 ```
 
-预期：所有测试通过。`test_agent.py` 使用脚本化假模型，完整走一遍“编辑 → 测试 → 全量验证 → 导出补丁”和“编辑 → 失败 → 回滚”，不会请求网络模型。
+预期：所有测试通过。`test_agent.py` 使用脚本化假模型，完整验证“编辑 → 测试 → 全量验证 → 导出补丁”“编辑 → 失败 → 回滚”以及“修改前暂停 → 人工批准/拒绝 → 从 SQLite checkpoint 恢复”，不会请求网络模型。
 
 再执行：
 
@@ -146,6 +149,7 @@ MODEL_ID=deepseek-chat
 | `TEST_TIMEOUT_SECONDS` | 45 | 单次 pytest 超时 |
 | `MAX_TOOL_OUTPUT_CHARS` | 6000 | 回喂模型的最大测试/文件输出长度 |
 | `VERIFY_ALL_TESTS` | true | 目标通过后是否运行完整测试集 |
+| `APPROVE_EDITS` | false | 修改生产文件前是否暂停并等待人工确认 |
 | `INPUT_PRICE_PER_MILLION` | 0 | 可选：每百万输入 token 的美元价格 |
 | `OUTPUT_PRICE_PER_MILLION` | 0 | 可选：每百万输出 token 的美元价格 |
 
@@ -163,9 +167,9 @@ MODEL_ID=deepseek-chat
 
 1. 把原始 fixture 复制到临时目录。
 2. 注入 `M01` 缺陷并提交为基线。
-3. 创建隔离 worktree。
+3. 创建隔离 worktree，并在 SQLite 中创建 LangGraph checkpoint。
 4. 运行目标测试，把失败信息交给模型。
-5. 让模型读代码、修改并重新测试。
+5. LangGraph 依次执行决策、工具调用、验证和结束节点。
 6. 目标通过后运行完整测试集。
 7. 保存 trace、补丁和单题结果，清理临时 worktree。
 
@@ -178,6 +182,8 @@ runs/evaluation_时间戳/
 └── tasks/M01/
     ├── trace.jsonl           # 每一步决策与工具观察
     ├── baseline.json         # 修复前的失败输出
+    ├── checkpoints.sqlite    # LangGraph 状态检查点
+    ├── run_context.json      # 恢复运行所需的非密钥上下文
     ├── attempt.patch         # 最后一次尝试的改动，无论成败
     ├── final.patch           # 仅成功时保留的有效补丁
     └── summary.json          # 单题状态、步数、token、耗时、回滚情况
@@ -220,6 +226,33 @@ git apply d:\code\unit-test-repair-agent\runs\你的运行目录\final.patch
 
 失败时 `final.patch` 为空，`attempt.patch` 只用于复盘，不建议直接应用。
 
+### 修改前人工确认与恢复
+
+给 `run` 加上 `--approve-edits` 后，Agent 每次要修改生产文件都会先暂停：
+
+```powershell
+.venv\Scripts\python.exe -m repair_agent run `
+  --repo d:\path\to\your-repo `
+  --test tests/test_example.py::test_case `
+  --max-steps 12 `
+  --approve-edits
+```
+
+此时：
+
+- 终端会打印将要修改的文件、旧字符串和新字符串；
+- 输入 `y` 批准继续，输入 `n` 拒绝本组修改并走失败回滚，输入 `q` 退出但保留现场；
+- `worktree/`、`checkpoints.sqlite` 和 `run_context.json` 都保留在运行目录；
+- `summary.json` 的 `status` 为 `paused`，`reason` 为 `approval_required`。
+
+之后可以在新终端继续或完成确认：
+
+```powershell
+.venv\Scripts\python.exe -m repair_agent resume --run-dir runs\你的运行目录
+```
+
+`resume` 会读取 `run_context.json`、重新连接同一个 worktree，并用原来的 `thread_id` 从 SQLite checkpoint 恢复。评测模式 `evaluate` 总是关闭人工确认，以保证指标可自动复现。
+
 ## 9. 第三步：运行完整 20 题评测
 
 先确认单题已成功，并了解 API 成本，再运行：
@@ -250,27 +283,45 @@ git apply d:\code\unit-test-repair-agent\runs\你的运行目录\final.patch
 
 评测是顺序执行的，避免并发请求导致限流，也避免多个任务争用本机资源。内置 fixture 是小型、可控的教学基准，不代表 SWE-bench 或大型仓库上的表现。
 
-## 10. 主链路：先理解这 6 步
+## 10. 主链路：先理解这张 LangGraph 状态图
 
 ```text
 失败 pytest
    ↓
 Git worktree 隔离 + 基线失败观察
    ↓
-LLM 根据 system prompt 和失败信息选择工具
+[decide] LangChain 调用模型并解析工具请求
    ↓
-read/search → edit → run_tests → 新观察
-   ↓                         │
-   └──── 未通过且步数未耗尽 ────┘
+是否要修改生产文件？
+   ├─ 是且开启人工确认 → [approve] interrupt 暂停 → 批准/拒绝
+   ├─ 否 / 已批准 ─────→ [act] 执行工具并记录观察
+   └─ 模型不再调用工具 → [finish]
    ↓
-目标通过 → 全量 pytest → 成功导出 patch / 失败回滚
+[act] read/search → edit → run_tests
+   ↓
+目标通过？
+   ├─ 否且步数未耗尽 → 回到 [decide]
+   ├─ 否且步数耗尽   → [finish]
+   └─ 是 → [verify] 运行完整 pytest
+              ├─ 通过 → [finish] 成功导出 patch
+              └─ 失败 → 新观察回喂 [decide]
 ```
+
+每个节点执行后都会写入 SQLite checkpoint；`finish` 节点只归一化最终状态，不执行破坏性操作。
 
 ## 11. 关键模块与设计取舍
 
-### `agent.py`：为什么是有界循环
+### `agent.py`：为什么管生命周期而不是把所有逻辑塞进图
 
-开放式 Agent 可能反复修改、持续消耗 token。这里用 `max_steps` 限制模型决策次数，并把“模型主动停止”“步数耗尽”“全量回归失败”区分为不同原因，便于失败分析。
+Agent 的准备与收尾涉及文件系统、Git 进程和不可序列化的运行对象：创建 worktree、采集基线、导出 patch、回滚和清理。这些放在 `agent.py`，LangGraph 状态图只维护可序列化的对话、工具请求、步数、token 和状态。这样暂停/恢复更可靠，图的职责也更容易解释。
+
+### `graph.py`：为什么用 LangGraph 而不是手写 while 循环
+
+手写循环适合理解原理，但条件分支、checkpoint、人工中断和恢复会很快散落在多个 if 分支里。LangGraph 将 `decide`、`approve`、`act`、`verify`、`finish` 声明为显式节点，用条件边表达“继续、验证、结束”，用 `interrupt()` 实现修改前人工确认，用 SqliteSaver 持久化状态。
+
+### `models.py`：为什么用 LangChain
+
+LangChain 负责统一模型调用、消息结构和工具绑定，并把模型返回转换为项目内的 `ToolCall`。项目不直接依赖某个 SDK 的私有字段，替换 OpenAI 兼容提供商时仍由 `.env` 控制。
 
 ### `tools.py`：为什么使用精确字符串替换
 
@@ -280,15 +331,11 @@ read/search → edit → run_tests → 新观察
 
 ### `workspace.py`：为什么原仓库始终不变
 
-所有编辑发生在 detached worktree。失败时执行 `git reset --hard <基线>` 和 `git clean -fd`，作用范围仅是本次临时 worktree；随后导出尝试补丁并清理。成功时先导出最终补丁再清理。
+所有编辑发生在 detached worktree。失败时执行 `git reset --hard <基线>` 和 `git clean -fd`，作用范围仅是本次临时 worktree；随后导出尝试补丁并清理。成功时先导出最终补丁再清理。暂停等待人工批准时不回滚、不清理，恢复后才继续。
 
-### `agent.py`：为什么目标通过还不够
+### `graph.py` 的 `verify`：为什么目标通过还不够
 
 只修复一个测试可能破坏其他功能。因此目标通过后默认运行 `pytest .`。全量失败会把新观察回喂模型继续修复。`--verify-target-only` 仅用于调试，不建议用于正式指标。
-
-### `models.py`：为什么不用框架
-
-OpenAI 兼容适配器明确展示 `assistant(tool_calls) → tool → assistant` 消息序列，方便理解和替换模型。它不等于支持所有提供商的特殊扩展。
 
 ### `benchmark.py`：为什么要先验证缺陷
 
@@ -317,13 +364,19 @@ OpenAI 兼容适配器明确展示 `assistant(tool_calls) → tool → assistant
 **成本估算为空**  
 这是预期行为。只有配置非零 token 单价后才估算；token 使用量始终来自真实 API 响应。
 
+**`resume` 提示 worktree 缺失**
+恢复依赖 `runs/.../worktree` 和 `checkpoints.sqlite`，不要手动删除暂停运行的目录。评测任务使用临时仓库，不建议把评测运行当作长期可恢复现场；需要演示恢复时优先使用 `run --approve-edits`。
+
+**恢复时模型或密钥已变化**
+`resume` 会从 `run_context.json` 恢复模型名、步数和验证设置；密钥仍从 `.env` 读取。更换模型后继续旧 checkpoint，结果不能和原运行混合统计。
+
 ## 13. 当前边界
 
 - 只支持修改已有文本文件，没有“新建文件”工具。
 - 不是通用 shell Agent，也不是安全的多租户沙箱；请在可丢弃的测试仓库中使用。
 - 只处理本地 pytest，不包含浏览器、网络检索或跨仓库依赖修复。
 - 内置 20 题用于验证闭环和比较模型/策略，不应宣称代表真实大型项目修复能力。
-- 尚未接入 LangGraph、MCP、Web UI 或并发评测；这些不是当前跑通所必需。
+- 已接入 LangChain 模型层和 LangGraph 编排、人工确认、SQLite checkpoint；尚未包含 MCP、Web UI、多智能体或并发评测。
 - 真实模型效果取决于模型能力、提示词、步数预算和任务难度，必须实测。
 
 简历描述应使用实际完成的范围和真实报告数字，不要把计划中的功能写成已实现。
