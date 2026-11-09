@@ -48,7 +48,8 @@ unit-test-repair-agent/
 │   ├── test_benchmark.py # 任务完整性与抽样基准验证
 │   └── test_mcp.py       # MCP 服务器配置解析
 ├── examples/
-│   └── demo_mcp_server.py # 一个最小 stdio MCP 服务器，用于演示 MCP 接入
+│   ├── demo_mcp_server.py # 最小 stdio MCP 服务器
+│   └── verify_mcp.py      # 连接 MCP 服务器并列出工具的自检脚本
 ├── .env.example          # 配置模板，不包含真实密钥
 ├── pyproject.toml        # 包信息、依赖与 pytest 配置
 └── runs/                 # 运行后生成；已被 Git 忽略
@@ -382,13 +383,24 @@ MCP 服务器返回的工具名可能与内置工具重名。注册时统一加 
 
 ## 13. MCP 工具接入
 
-在 `.env` 里配置 `MCP_SERVERS`（JSON 数组），例如接入内置演示服务器：
+在 `.env` 里配置 `MCP_SERVERS`（JSON 数组），每项描述一个服务器：`name` 作为工具名前缀，`command` + `args` 走 stdio 传输，或 `transport` + `url` 走 SSE 传输。任何符合 MCP 规范的服务器都按同样结构接入，区别只在启动命令。
+
+### 13.1 官方 Git MCP Server
+
+本机验证通过的是 MCP 官方参考实现里的 `mcp-server-git`（Python 包），连上后暴露 14 个工具：`git_log`、`git_show`、`git_diff_unstaged`、`git_status`、`git_branch` 等。
 
 ```dotenv
-MCP_SERVERS=[{"name":"memory","command":".venv\\Scripts\\python.exe","args":["-m","examples.demo_mcp_server"]}]
+MCP_SERVERS=[{"name":"git","command":"<装了 mcp-server-git 的 python.exe>","args":["-m","mcp_server_git","--repository","<目标仓库路径>"]}]
 ```
 
-连接后，模型的工具列表会多出 `mcp__memory__remember`、`mcp__memory__recall`。`command` 必须指向一个安装了 `mcp` 的 Python（Windows 下建议用本项目 `.venv\Scripts\python.exe` 的绝对路径）。
+它补的是内置工具的能力空白：**内置只能看文件当前内容，看不到历史**。
+
+- **定位回归**：`git_log` 看最近提交、`git_show` 看某次提交的 diff，快速判断是哪次改动让测试挂的。
+- **自我核对**：改完用 `git_diff_unstaged` 确认自己实际改了什么，而不是重读文件去猜——正好落在「验证」阶段。
+
+对应工具名带前缀，例如 `mcp__git__git_log`。调用注意：这些工具不是零参数的，`repo_path` 必填，`git_show` 还要 `revision`（如 `HEAD`）。
+
+连接失败时该服务器被跳过，内置工具照常可用，主流程不中断。
 
 ## 14. 当前边界
 
